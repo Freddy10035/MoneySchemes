@@ -155,6 +155,25 @@ def account_margin_summary(client: BinanceClient, symbols: set[str], reserve: De
             print(f"  {symbol}: {exc}")
 
 
+def active_exposure(client: BinanceClient, symbols: set[str]) -> list[str]:
+    active: list[str] = []
+    if not client.api_key or not client.api_secret:
+        return active
+    positions = client.signed_get("/fapi/v2/positionRisk")
+    for position in positions:
+        symbol = position.get("symbol")
+        if symbol not in symbols:
+            continue
+        amount = Decimal(str(position.get("positionAmt", "0")))
+        if amount != 0:
+            active.append(f"{symbol} positionAmt={fmt_decimal(amount)}")
+    for symbol in sorted(symbols):
+        orders = client.signed_get("/fapi/v1/openOrders", {"symbol": symbol})
+        if orders:
+            active.append(f"{symbol} openOrders={len(orders)}")
+    return active
+
+
 class BinanceError(RuntimeError):
     pass
 
@@ -390,7 +409,14 @@ def scan(client: BinanceClient, min_volume: float, limit: int, candidates: int) 
         )
 
 
-def judge(client: BinanceClient, margin: Decimal, leverage: int, target_pct: Decimal, stop_pct: Decimal, reserve: Decimal) -> None:
+def evaluate_setups(
+    client: BinanceClient,
+    margin: Decimal,
+    leverage: int,
+    target_pct: Decimal,
+    stop_pct: Decimal,
+    reserve: Decimal,
+) -> tuple[set[str], list[dict[str, Any]]]:
     allowed = allowed_symbols()
     if not allowed:
         raise BinanceError("ALLOWED_SYMBOLS is empty. Refusing to judge an unrestricted universe.")
@@ -469,9 +495,13 @@ def judge(client: BinanceClient, margin: Decimal, leverage: int, target_pct: Dec
                     build_ticket(client, row["symbol"], side, ticket_margin, leverage, target_pct, stop_pct)
                 except BinanceError as exc:
                     reasons.append(f"account cannot fit at {leverage}x with margin {fmt_decimal(ticket_margin)}: {exc}")
-        decisions.append({**row, "side": side, "score": score, "reasons": reasons})
+        decisions.append({**row, "side": side, "score": score, "reasons": reasons, "ticket_margin": ticket_margin})
 
     decisions.sort(key=lambda row: (len(row["reasons"]) == 0, row["score"]), reverse=True)
+    return allowed, decisions
+
+
+def print_judgement(decisions: list[dict[str, Any]]) -> None:
     print("JUDGEMENT")
     for row in decisions:
         verdict = "PASS" if not row["reasons"] else "REJECT"
@@ -483,6 +513,10 @@ def judge(client: BinanceClient, margin: Decimal, leverage: int, target_pct: Dec
             f"- {reason_text}"
         )
 
+
+def judge(client: BinanceClient, margin: Decimal, leverage: int, target_pct: Decimal, stop_pct: Decimal, reserve: Decimal) -> None:
+    allowed, decisions = evaluate_setups(client, margin, leverage, target_pct, stop_pct, reserve)
+    print_judgement(decisions)
     best = decisions[0]
     if best["reasons"]:
         print("\nACTION: WAIT")
@@ -490,7 +524,7 @@ def judge(client: BinanceClient, margin: Decimal, leverage: int, target_pct: Dec
         account_margin_summary(client, allowed, reserve)
         return
 
-    margin = adjusted_margin(client, margin, reserve) if client.api_key and client.api_secret else margin
+    margin = best.get("ticket_margin") or (adjusted_margin(client, margin, reserve) if client.api_key and client.api_secret else margin)
     ticket = build_ticket(client, best["symbol"], best["side"], margin, leverage, target_pct, stop_pct)
     print("\nACTION: ARM THIS TICKET")
     print_ticket(ticket)
@@ -506,6 +540,125 @@ def judge(client: BinanceClient, margin: Decimal, leverage: int, target_pct: Dec
         f"--margin {fmt_decimal(margin)} --leverage {leverage} "
         f"--target-pct {fmt_decimal(target_pct)} --stop-pct {fmt_decimal(stop_pct)} --live"
     )
+
+
+def watch(
+    client: BinanceClient,
+    margin: Decimal,
+    leverage: int,
+    target_pct: Decimal,
+    stop_pct: Decimal,
+    reserve: Decimal,
+    interval_seconds: int,
+    min_score: Decimal,
+    confirmations: int,
+    live_auto: bool,
+    max_trades_per_day: int,
+    cooldown_seconds: int,
+    max_cycles: int | None,
+) -> None:
+    if interval_seconds < 10:
+        raise BinanceError("Watch interval must be at least 10 seconds.")
+    if confirmations < 1:
+        raise BinanceError("Confirmations must be at least 1.")
+    if live_auto and (not client.api_key or not client.api_secret):
+        raise BinanceError("--live-auto requires BINANCE_API_KEY and BINANCE_API_SECRET.")
+
+    allowed = allowed_symbols()
+    if not allowed:
+        raise BinanceError("ALLOWED_SYMBOLS is empty. Refusing to watch an unrestricted universe.")
+
+    mode = "LIVE-AUTO" if live_auto else "DRY-RUN"
+    print(f"WATCH MODE: {mode}")
+    print(f"allowed symbols: {', '.join(sorted(allowed))}")
+    print(
+        f"interval={interval_seconds}s min_score={fmt_decimal(min_score)} confirmations={confirmations} "
+        f"max_trades_per_day={max_trades_per_day} reserve={fmt_decimal(reserve)}"
+    )
+    if live_auto:
+        print("Live auto mode will place orders without typed confirmation when all gates pass.")
+
+    streak_key: tuple[str, str] | None = None
+    streak_count = 0
+    trades_today = 0
+    trade_day = time.strftime("%Y-%m-%d")
+    cooldown_until = 0.0
+    cycle = 0
+
+    while True:
+        now = time.time()
+        today = time.strftime("%Y-%m-%d")
+        if today != trade_day:
+            trade_day = today
+            trades_today = 0
+
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[{timestamp}] cycle={cycle + 1}")
+
+        try:
+            allowed, decisions = evaluate_setups(client, margin, leverage, target_pct, stop_pct, reserve)
+            best = decisions[0]
+            reason_text = "clean enough to arm" if not best["reasons"] else "; ".join(best["reasons"])
+            print(
+                f"best={best['symbol']} {best['side']} score={best['score']:.1f} "
+                f"15m={best['ret15']:.2f}% 1h={best['ret1h']:.2f}% - {reason_text}"
+            )
+
+            active = active_exposure(client, allowed) if client.api_key and client.api_secret else []
+            if active:
+                print(f"ACTION: WAIT active exposure/order exists: {'; '.join(active)}")
+                streak_key = None
+                streak_count = 0
+            elif best["reasons"]:
+                print("ACTION: WAIT judgement rejected best setup")
+                streak_key = None
+                streak_count = 0
+            elif Decimal(str(best["score"])) < min_score:
+                print(f"ACTION: WAIT score below watch min_score {fmt_decimal(min_score)}")
+                streak_key = None
+                streak_count = 0
+            elif trades_today >= max_trades_per_day:
+                print(f"ACTION: WAIT daily trade cap reached ({trades_today}/{max_trades_per_day})")
+            elif now < cooldown_until:
+                remaining = int(cooldown_until - now)
+                print(f"ACTION: WAIT cooldown active for {remaining}s")
+            else:
+                key = (best["symbol"], best["side"])
+                if key == streak_key:
+                    streak_count += 1
+                else:
+                    streak_key = key
+                    streak_count = 1
+
+                if streak_count < confirmations:
+                    print(f"ACTION: WAIT confirmation streak {streak_count}/{confirmations} for {best['symbol']} {best['side']}")
+                else:
+                    ticket_margin = best.get("ticket_margin") or margin
+                    ticket = build_ticket(client, best["symbol"], best["side"], ticket_margin, leverage, target_pct, stop_pct)
+                    if live_auto:
+                        print("ACTION: LIVE TRADE")
+                        place_order(client, ticket, live=True, reserve=reserve, require_confirmation=False)
+                        trades_today += 1
+                        cooldown_until = time.time() + cooldown_seconds
+                    else:
+                        print("ACTION: DRY SIGNAL")
+                        print_ticket(ticket)
+                        print(
+                            f"live command: python trade_copilot.py place {best['symbol']} {best['side']} "
+                            f"--margin {fmt_decimal(ticket_margin)} --leverage {leverage} "
+                            f"--target-pct {fmt_decimal(target_pct)} --stop-pct {fmt_decimal(stop_pct)} --live"
+                        )
+                        cooldown_until = time.time() + cooldown_seconds
+                    streak_key = None
+                    streak_count = 0
+        except BinanceError as exc:
+            print(f"ACTION: WAIT error={exc}", file=sys.stderr)
+
+        cycle += 1
+        if max_cycles is not None and cycle >= max_cycles:
+            print("WATCH STOP: max cycles reached")
+            return
+        time.sleep(interval_seconds)
 
 
 def auth_check(client: BinanceClient) -> None:
@@ -635,7 +788,7 @@ def ignore_margin_type_error(exc: BinanceError) -> bool:
     return "-4046" in text or "No need to change margin type" in text
 
 
-def place_order(client: BinanceClient, ticket: dict[str, Any], live: bool, reserve: Decimal) -> None:
+def place_order(client: BinanceClient, ticket: dict[str, Any], live: bool, reserve: Decimal, require_confirmation: bool = True) -> None:
     print_ticket(ticket)
     if not live:
         print("\nDRY RUN ONLY. Add --live to place orders.")
@@ -653,9 +806,12 @@ def place_order(client: BinanceClient, ticket: dict[str, Any], live: bool, reser
         print_ticket(ticket)
 
     phrase = f"PLACE {ticket['symbol']} {ticket['bias']} {fmt_decimal(ticket['margin'])}"
-    typed = input(f"\nType exactly '{phrase}' to place LIVE Binance futures orders: ").strip()
-    if typed != phrase:
-        raise BinanceError("Confirmation did not match. No live order placed.")
+    if require_confirmation:
+        typed = input(f"\nType exactly '{phrase}' to place LIVE Binance futures orders: ").strip()
+        if typed != phrase:
+            raise BinanceError("Confirmation did not match. No live order placed.")
+    else:
+        print(f"\nAUTO LIVE CONFIRMATION: {phrase}")
 
     symbol = ticket["symbol"]
     qty = fmt_decimal(ticket["quantity"])
@@ -778,6 +934,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     judge_parser.add_argument("--stop-pct", type=decimal_arg, default=Decimal("3"))
     judge_parser.add_argument("--reserve", type=decimal_arg, default=Decimal("0.5"), help="USDT to leave unused when account sizing is available")
 
+    watch_parser = sub.add_parser("watch", help="run judgement in a loop and optionally trade rare clean setups")
+    watch_parser.add_argument("--margin", type=decimal_arg, default=Decimal("5"), help="USDT margin to allocate")
+    watch_parser.add_argument("--leverage", type=int, default=15)
+    watch_parser.add_argument("--target-pct", type=decimal_arg, default=Decimal("6.8"))
+    watch_parser.add_argument("--stop-pct", type=decimal_arg, default=Decimal("3"))
+    watch_parser.add_argument("--reserve", type=decimal_arg, default=Decimal("0.5"), help="USDT to leave unused when account sizing is available")
+    watch_parser.add_argument("--interval", type=int, default=60, help="seconds between judgement cycles")
+    watch_parser.add_argument("--min-score", type=decimal_arg, default=Decimal("25"), help="minimum passing score required for watch signals")
+    watch_parser.add_argument("--confirmations", type=int, default=2, help="number of consecutive matching passes required")
+    watch_parser.add_argument("--max-trades-per-day", type=int, default=3)
+    watch_parser.add_argument("--cooldown", type=int, default=900, help="seconds to wait after a signal/trade")
+    watch_parser.add_argument("--max-cycles", type=int, default=None, help="stop after this many cycles; omit to run until Ctrl+C")
+    watch_parser.add_argument("--live-auto", action="store_true", help="place live orders without typed confirmation when all watch gates pass")
+
     sub.add_parser("auth", help="check .env, current public IP, and signed Binance futures access")
 
     levels_parser = sub.add_parser("levels", help="print current levels for a symbol")
@@ -809,6 +979,22 @@ def main(argv: list[str] | None = None) -> int:
             auth_check(client)
         elif args.command == "judge":
             judge(client, args.margin, args.leverage, args.target_pct, args.stop_pct, args.reserve)
+        elif args.command == "watch":
+            watch(
+                client,
+                args.margin,
+                args.leverage,
+                args.target_pct,
+                args.stop_pct,
+                args.reserve,
+                args.interval,
+                args.min_score,
+                args.confirmations,
+                args.live_auto,
+                args.max_trades_per_day,
+                args.cooldown,
+                args.max_cycles,
+            )
         elif args.command == "levels":
             print_levels(client, args.symbol)
         elif args.command in {"ticket", "place"}:

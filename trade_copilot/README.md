@@ -15,6 +15,7 @@ This is not an investment system, financial advice, or a promise of profit. It i
 - Refuses impossible tickets when available margin cannot meet Binance minimum notional rules.
 - Uses a local futures symbol whitelist through `ALLOWED_SYMBOLS`.
 - Places live orders only with `--live` and an exact typed confirmation.
+- Can run a long-lived `watch` loop that waits for rare clean setups.
 - Uses isolated margin, sets leverage, opens a market entry, then places reduce-only stop-market and take-profit-market exits.
 
 ## Safety Model
@@ -28,6 +29,8 @@ The copilot is intentionally conservative about execution mechanics:
 - The account must be in One-way Mode.
 - Multi-Assets Mode must be off.
 - Live mode checks available futures margin before attempting entry.
+- Watch mode does not stack risk: if an allowed symbol already has a position or open order, it waits.
+- Watch mode has confirmation streaks, cooldowns, and daily trade caps.
 - If exit-order placement fails after entry, the script attempts a reduce-only emergency market close.
 
 Use a restricted Binance API key:
@@ -134,6 +137,44 @@ python trade_copilot.py judge --margin 5 --leverage 15 --target-pct 6.8 --stop-p
 ```
 
 `--reserve` leaves some USDT unused when account-aware sizing is available.
+
+### Watch
+
+```bash
+python trade_copilot.py watch
+```
+
+Runs the judgement layer in a loop. By default this is dry-run only: it prints `ACTION: WAIT` or `ACTION: DRY SIGNAL` but does not place orders.
+
+Useful dry-run example:
+
+```bash
+python trade_copilot.py watch --interval 60 --min-score 25 --confirmations 2 --max-trades-per-day 3 --reserve 0.5
+```
+
+For a one-cycle test:
+
+```bash
+python trade_copilot.py watch --max-cycles 1 --interval 10
+```
+
+Live autonomous mode is explicit:
+
+```bash
+python trade_copilot.py watch --live-auto --interval 60 --min-score 25 --confirmations 2 --max-trades-per-day 3 --cooldown 900
+```
+
+`--live-auto` places orders without the typed confirmation used by `place --live`. Use it only with a restricted API key, a tight `ALLOWED_SYMBOLS` list, and money you can afford to lose.
+
+Watch gates:
+
+- The best setup must pass all judgement filters.
+- The score must be at least `--min-score`.
+- The same symbol and side must pass for `--confirmations` consecutive cycles.
+- Existing allowed-symbol positions or open orders block new trades.
+- The daily trade cap must not be reached.
+- The cooldown must be finished.
+- Account margin must fit Binance minimum notional rules.
 
 ### Levels
 
