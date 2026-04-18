@@ -1,0 +1,2 @@
+# No external packages are required yet.
+# The copilot currently uses only the Python standard library.
